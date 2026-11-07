@@ -26,13 +26,13 @@ buildNpmPackage {
     npm run build
   '';
 
+  # The upstream `catalogue/media/` exercise media is intentionally NOT bundled: it is not
+  # AGPL and redistribution is restricted, so it cannot live in the nixpkgs store path.
+  # Operators who need it supply a copy via services.opengym.mediaRoot (see the NixOS module).
   installPhase = ''
     runHook preInstall
 
-    mkdir -p $out/exercise-media
     cp -R dist/* $out/
-
-    cp -R ../catalogue/media/* $out/exercise-media/
 
     runHook postInstall
   '';

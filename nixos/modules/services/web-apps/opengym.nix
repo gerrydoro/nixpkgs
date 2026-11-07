@@ -174,7 +174,11 @@ in
       type = lib.types.str;
       default = cfg.origin;
       defaultText = lib.literalExpression "config.services.opengym.origin";
-      description = "Contact URL sent with push notifications.";
+      description = ''
+        Contact URL sent with web push. Must be an `https://` or `mailto:` URL; any other value is
+        left unset, so on a plain-HTTP origin the app falls back to its built-in `mailto:` subject
+        instead of crashing at boot.
+      '';
     };
 
     coachDisabled = lib.mkOption {
@@ -201,7 +205,23 @@ in
       type = lib.types.str;
       default = "/";
       example = "/gym";
-      description = "Serve openGym under a sub-path. Must match the reverse proxy routing.";
+      description = ''
+        Base path the app uses for its own URLs. The built-in `reverseProxy` always serves at the
+        root and ignores this value, so only set it when you run your own reverse proxy; sub-path
+        deployments through the built-in proxy are not supported (evaluation warns about the
+        combination).
+      '';
+    };
+
+    mediaRoot = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Directory holding the openGym exercise media (with `still/` and `clip/` subdirectories),
+        served at `/exercise-media/` by the built-in reverse proxy. The upstream media is not
+        AGPL and is therefore not bundled with the package; point this at a copy you have the
+        right to serve. When null, no exercise media is served.
+      '';
     };
 
     allowedPrivateIps = lib.mkOption {
@@ -251,7 +271,11 @@ in
 
   config = lib.mkIf cfg.enable {
     systemd.services.opengym = {
-      description = "openGym Backend API";
+      # Warn (not fail) at evaluation time when the unsupported combination is configured.
+      description =
+        lib.warnIf (cfg.basePath != "/" && cfg.reverseProxy.enable)
+          "services.opengym: `basePath` is not supported by the built-in `reverseProxy` (it always serves at the root); configure your own reverse proxy for sub-path deployments."
+          "openGym Backend API";
       after = [ "network.target" ];
       wantedBy = [ "multi-user.target" ];
 
@@ -273,7 +297,12 @@ in
         AUDIT_MAX = toString cfg.auditMax;
         AUDIT_DAYS = toString cfg.auditDays;
         AUDIT_IP = cfg.auditIp;
-        VAPID_SUBJECT = cfg.vapidSubject;
+        # Only send a VAPID subject the app will accept (https: or mailto:). On a plain-HTTP
+        # origin leave it unset so server.js falls back to mailto:admin@localhost instead of
+        # crashing at webpush.setVapidDetails.
+        VAPID_SUBJECT = lib.mkIf (
+          lib.hasPrefix "https://" cfg.vapidSubject || lib.hasPrefix "mailto:" cfg.vapidSubject
+        ) cfg.vapidSubject;
         COACH_DISABLED = if cfg.coachDisabled then "1" else "0";
         COACH_JOB_TIMEOUT_MS = lib.mkIf (cfg.coachJobTimeoutSeconds != null) (
           toString (cfg.coachJobTimeoutSeconds * 1000)
@@ -307,15 +336,21 @@ in
       enable = true;
       virtualHosts."${cfg.reverseProxy.host}:${toString cfg.reverseProxy.port}".extraConfig = ''
         handle /api/* {
-          reverse_proxy localhost:${toString cfg.port}
+          reverse_proxy localhost:${toString cfg.port} {
+            # Clobber the client-supplied X-Forwarded-For so a client cannot spoof its
+            # address when the backend reads it under TRUST_PROXY.
+            header_up X-Forwarded-For {remote_host}
+          }
         }
-
-        # Intercept built-in frontend media requests and map them to the Nix store path
-        handle_path /media/* {
-          root * ${cfg.package.passthru.frontend}/exercise-media
+      ''
+      + lib.optionalString (cfg.mediaRoot != null) ''
+        # Exercise media is not bundled (non-AGPL); serve a copy the operator provides.
+        handle /exercise-media/* {
+          root * ${cfg.mediaRoot}
           file_server
         }
-
+      ''
+      + ''
         # Catch-all for React static files and SPA fallback
         handle {
           root * ${cfg.package.passthru.frontend}
@@ -336,14 +371,25 @@ in
         ];
         locations."/api/" = {
           proxyPass = "http://127.0.0.1:${toString cfg.port}";
+          # The recommended proxy settings would set `X-Forwarded-For
+          # $proxy_add_x_forwarded_for`, re-appending the client's own value;
+          # disable them and re-declare the headers with the real address.
+          recommendedProxySettings = false;
           extraConfig = ''
             client_max_body_size ${if cfg.media.uploads then "48M" else "5M"};
             proxy_read_timeout 300s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            # Clobber the client-supplied X-Forwarded-For so a client cannot spoof its
+            # address when the backend reads it under TRUST_PROXY.
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
           '';
         };
 
-        locations."/media/" = {
-          alias = "${cfg.package.passthru.frontend}/exercise-media/";
+        # Exercise media is not bundled (non-AGPL); serve a copy the operator provides.
+        locations."/exercise-media/" = lib.mkIf (cfg.mediaRoot != null) {
+          alias = "${cfg.mediaRoot}/";
         };
 
         locations."/" = {
